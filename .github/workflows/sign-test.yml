@@ -1,0 +1,99 @@
+name: Cosign Signing Test
+
+on:
+  push:
+    branches:
+      - signing-test
+
+permissions:
+  contents: read
+
+env:
+  COSIGN_VERSION: v3.1.4
+  COSIGN_SHA256: 424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa
+  TARGET_IMAGE: registry.cosmotech.com/signing-test/cosmotech-api
+
+jobs:
+  build_push_sign:
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_BUILDKIT: 1
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Fetch all tags since Gradle project version is built upon SCM
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: "temurin"
+          java-version: "23"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '9.7.1'
+
+      - name: Build local Container Image
+        run: >
+            ./gradlew
+            :cosmotech-api:jibDockerBuild
+            -Djib.to.image=com.cosmotech/cosmotech-api:${{ github.sha }}
+            -Pbaseimage.repository.user='${{ secrets.HARBOR_ROBOT_ACCOUNT_NAME }}'
+            -Pbaseimage.repository.password='${{ secrets.HARBOR_ROBOT_ACCOUNT_SECRET }}'
+
+      - name: Login to Cosmotech Container Registry
+        uses: docker/login-action@v4.7.0
+        with:
+          registry: registry.cosmotech.com
+          username: ${{ secrets.HARBOR_ROBOT_ACCOUNT_NAME }}
+          password: ${{ secrets.HARBOR_ROBOT_ACCOUNT_SECRET }}
+
+      - name: Push API Container Image (sha) to signing-test project
+        run: |
+          docker image tag com.cosmotech/cosmotech-api:${{ github.sha }} \
+            "${TARGET_IMAGE}:${{ github.sha }}"
+          docker image push "${TARGET_IMAGE}:${{ github.sha }}"
+
+      - name: Retrieve pushed image digest
+        id: digest
+        run: |
+          ref=$(docker image inspect "${TARGET_IMAGE}:${{ github.sha }}" \
+            --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+            | grep -F "${TARGET_IMAGE}@sha256:" | head -n1)
+          if [ -z "${ref}" ]; then
+            echo "No RepoDigest found for ${TARGET_IMAGE}" >&2
+            exit 1
+          fi
+          echo "Image reference: ${ref}"
+          echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install cosign
+        run: |
+          curl -sSfL -o cosign \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          echo "${COSIGN_SHA256}  cosign" | sha256sum --check --strict
+          sudo install -m 0755 cosign /usr/local/bin/cosign
+          rm cosign
+          cosign version
+
+      - name: Sign image by digest
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: >
+            cosign sign
+            --yes
+            --key env://COSIGN_PRIVATE_KEY
+            --signing-config signing-config-notlog.json
+            "${{ steps.digest.outputs.ref }}"
+
+      - name: Verify signature
+        run: >
+            cosign verify
+            --key cosign.pub
+            --insecure-ignore-tlog=true
+            "${{ steps.digest.outputs.ref }}"
