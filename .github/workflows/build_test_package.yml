@@ -199,6 +199,8 @@ jobs:
     env:
       DOCKER_BUILDKIT: 1
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      COSIGN_VERSION: v3.1.4
+      COSIGN_SHA256: 424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa
     ## Do not launch scan/push job if the PR is created by dependabot
     ## This job needs to build a run API image (via jib) that target base image stored in private repository.
     ## Credentials should not be shared to dependabot (for security reason)
@@ -295,11 +297,6 @@ jobs:
           docker image tag com.cosmotech/cosmotech-api:${{github.sha}} \
             ghcr.io/cosmo-tech/cosmotech-api:latest
           docker image push ghcr.io/cosmo-tech/cosmotech-api:latest
-          curl --request POST \
-            --url "https://api.github.com/repos/cosmo-tech/helm-charts/actions/workflows/api_restart.yml/dispatches" \
-            --header "Accept: application/vnd.github.v3+json" \
-            --header "Authorization: Bearer ${{ secrets.TRIGGER_HELM_CHARTS_WORKFLOW_PAT }}" \
-            --data '{ "ref": "main" }'
 
       - name: Login to Cosmotech Container Registry
         uses: docker/login-action@v4.7.0
@@ -315,3 +312,58 @@ jobs:
           docker image tag com.cosmotech/cosmotech-api:${{github.sha}} \
             registry.cosmotech.com/product/cosmotech-api:${{ steps.refvar.outputs.gitRefName }}
           docker image push registry.cosmotech.com/product/cosmotech-api:${{ steps.refvar.outputs.gitRefName }}
+
+      - name: Install cosign
+        if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          curl -sSfL -o cosign \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          echo "${COSIGN_SHA256}  cosign" | sha256sum --check --strict
+          sudo install -m 0755 cosign /usr/local/bin/cosign
+          rm cosign
+          cosign version
+
+      ## Signatures are stored next to the image in each registry, so every
+      ## registry the image was pushed to gets its own signature (by digest).
+      - name: Sign pushed images by digest
+        if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          signed=0
+          for repo in ghcr.io/cosmo-tech/cosmotech-api registry.cosmotech.com/product/cosmotech-api; do
+            ref=$(docker image inspect "com.cosmotech/cosmotech-api:${{ github.sha }}" \
+              --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+              | grep -F "${repo}@sha256:" | head -n1)
+            if [ -z "${ref}" ]; then
+              echo "Image not pushed to ${repo}, skipping"
+              continue
+            fi
+            echo "Signing ${ref}"
+            cosign sign \
+              --yes \
+              --key env://COSIGN_PRIVATE_KEY \
+              --signing-config signing-config-notlog.json \
+              "${ref}"
+            cosign verify \
+              --key cosign.pub \
+              --insecure-ignore-tlog=true \
+              "${ref}"
+            signed=$((signed + 1))
+          done
+          if [ "${signed}" -eq 0 ]; then
+            echo "No pushed image found to sign" >&2
+            exit 1
+          fi
+
+      ## Triggered only once the image is signed, so a signature-enforcing
+      ## cluster can pull the new image right away.
+      - name: Trigger API restart in helm-charts
+        if: github.ref == 'refs/heads/main'
+        run: |
+          curl --request POST \
+            --url "https://api.github.com/repos/cosmo-tech/helm-charts/actions/workflows/api_restart.yml/dispatches" \
+            --header "Accept: application/vnd.github.v3+json" \
+            --header "Authorization: Bearer ${{ secrets.TRIGGER_HELM_CHARTS_WORKFLOW_PAT }}" \
+            --data '{ "ref": "main" }'
